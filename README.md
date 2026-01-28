@@ -2,6 +2,7 @@
 This combines the features of the following 2 projects:
 
 https://github.com/xl0/nvml-tool
+
 https://github.com/ThomasBaruzier/gddr6-core-junction-vram-temps
 
 This is to allow fan control with the VRAM temperature instead of core temperature
