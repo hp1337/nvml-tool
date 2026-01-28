@@ -1,17 +1,28 @@
+// /home/himesh/nvml-tool/src/main.c
 #define _GNU_SOURCE
+#include <ctype.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <getopt.h>
 #include <nvml.h>
+#include <pci/pci.h> // Added for PCI access
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h> // Added for memory mapping
 #include <unistd.h>
 
 #define MAX_DEVICES 64
 #define MAX_NAME_LEN 256
 #define MAX_UUID_LEN 80
 #define MAX_SETPOINTS 16
+
+// VRAM Temperature Constants
+#define MEM_PATH "/dev/mem"
+#define VRAM_REGISTER_OFFSET 0x0000E2A8
+#define PG_SZ sysconf(_SC_PAGE_SIZE)
 
 typedef enum {
   CMD_NONE,
@@ -21,10 +32,13 @@ typedef enum {
   CMD_TEMP,
   CMD_STATUS,
   CMD_LIST,
-  CMD_FANCTL
+  CMD_FANCTL,
+  CMD_VRAMTEMP  // Add new command here
 } command_t;
 
 typedef enum { SUBCMD_NONE, SUBCMD_SET, SUBCMD_RESTORE, SUBCMD_JSON } subcommand_t;
+
+typedef enum { SENSOR_CORE, SENSOR_VRAM } sensor_t; // Added for sensor selection
 
 typedef struct {
   unsigned int temp;
@@ -43,78 +57,111 @@ typedef struct {
   char temp_unit;
   setpoint_t setpoints[MAX_SETPOINTS];
   int setpoint_count;
+  sensor_t sensor; // Added sensor preference
 } cli_args_t;
 
-// Global variables for signal handling
+// Global variables for signal handling and PCI context
 static volatile int running = 1;
 static nvmlDevice_t controlled_devices[MAX_DEVICES];
 static int controlled_device_ids[MAX_DEVICES];
 static int controlled_device_count = 0;
 static int is_terminal = 0;
 
-static void signal_handler(int signum) {
-  running = 0;
+// PCI context for VRAM access
+static struct pci_access *pacc = NULL;
+static int pci_initialized = 0;
 
-  // Use write() instead of printf() - it's async-signal-safe
-  static const char msg[] = "\nRestoring automatic fan control...\n";
-  ssize_t unused __attribute__((unused)) = write(STDOUT_FILENO, msg, sizeof(msg) - 1);
-
-  for (int i = 0; i < controlled_device_count; i++) {
-    unsigned int num_fans = 0;
-    if (nvmlDeviceGetNumFans(controlled_devices[i], &num_fans) == NVML_SUCCESS) {
-      for (unsigned int fan = 0; fan < num_fans; fan++) {
-        nvmlDeviceSetFanControlPolicy(controlled_devices[i], fan,
-                                      NVML_FAN_POLICY_TEMPERATURE_CONTINOUS_SW);
-      }
-    }
+static void cleanup_pci(void) {
+  if (pacc) {
+    pci_cleanup(pacc);
+    pacc = NULL;
+    pci_initialized = 0;
   }
-
-  // For crash signals, we must exit to avoid infinite signal loop
-  if (signum == SIGSEGV || signum == SIGBUS || signum == SIGFPE || signum == SIGILL)
-    _exit(128 + signum); // _exit is async-signal-safe, exit() is not
 }
 
-static void sigtstp_handler(int signum) {
-  (void)signum;
+static int init_pci(void) {
+  if (pci_initialized) return 0;
 
-  // Restore automatic fan control before suspending
-  static const char msg[] = "\nSuspending - restoring automatic fan control...\n";
-  ssize_t unused __attribute__((unused)) = write(STDOUT_FILENO, msg, sizeof(msg) - 1);
-
-  for (int i = 0; i < controlled_device_count; i++) {
-    unsigned int num_fans = 0;
-    if (nvmlDeviceGetNumFans(controlled_devices[i], &num_fans) == NVML_SUCCESS) {
-      for (unsigned int fan = 0; fan < num_fans; fan++) {
-        nvmlDeviceSetFanControlPolicy(controlled_devices[i], fan,
-                                      NVML_FAN_POLICY_TEMPERATURE_CONTINOUS_SW);
-      }
-    }
+  pacc = pci_alloc();
+  if (!pacc) {
+    fprintf(stderr, "Error: Failed to allocate PCI structure\n");
+    return -1;
   }
-
-  // Reset SIGTSTP to default and re-raise to actually suspend
-  signal(SIGTSTP, SIG_DFL);
-  raise(SIGTSTP);
-}
-
-static void sigcont_handler(int signum) {
-  (void)signum;
-
-  static const char msg[] = "Resuming manual fan control...\n";
-  ssize_t unused __attribute__((unused)) = write(STDOUT_FILENO, msg, sizeof(msg) - 1);
-
-  // Re-register SIGTSTP handler for next Ctrl+Z
-  // Note: Fan speeds will be set on the next loop iteration (up to 2s delay)
-  signal(SIGTSTP, sigtstp_handler);
-}
-
-// Parse string to long with validation. Returns 0 on success, -1 on error.
-static int parse_long(const char* str, long* out, long min, long max) {
-  char* endptr;
-  long val = strtol(str, &endptr, 10);
-  if (endptr == str || *endptr != '\0') return -1; // No digits or trailing garbage
-  if (val < min || val > max) return -1;
-  *out = val;
+  pci_init(pacc);
+  pci_scan_bus(pacc);
+  pci_initialized = 1;
   return 0;
+}
+
+// Helper to find pci_dev matching NVML device
+static struct pci_dev* find_pci_dev(nvmlDevice_t device) {
+  nvmlPciInfo_t pci_info;
+  if (nvmlDeviceGetPciInfo(device, &pci_info) != NVML_SUCCESS) return NULL;
+
+  for (struct pci_dev *dev = pacc->devices; dev; dev = dev->next) {
+    pci_fill_info(dev, PCI_FILL_IDENT | PCI_FILL_BASES);
+
+    // Match logic from gputemps
+    // Use pciDeviceId (capital D) as per compiler error message
+    if ((dev->device_id << 16 | dev->vendor_id) == pci_info.pciDeviceId &&
+        (unsigned int)dev->domain == pci_info.domain &&
+        dev->bus == (int)pci_info.bus &&
+        dev->dev == (int)pci_info.device) {
+      return dev;
+    }
+  }
+  return NULL;
+}
+
+static int read_vram_temp(nvmlDevice_t device, unsigned int *temp) {
+  struct pci_dev *dev = find_pci_dev(device);
+  if (!dev) {
+    return -1; // Device not found in PCI list
+  }
+
+  int fd = open(MEM_PATH, O_RDWR | O_SYNC);
+  if (fd < 0) {
+    fprintf(stderr, "Error: Failed to open %s (root required): %s\n", MEM_PATH, strerror(errno));
+    return -1;
+  }
+
+  // Calculate register address
+  // dev->base_addr[0] is the BAR0 base address
+  uint32_t reg_addr = (dev->base_addr[0] & 0xFFFFFFFF) + VRAM_REGISTER_OFFSET;
+  uint32_t base_offset = reg_addr & ~(PG_SZ - 1);
+  void *map_base = mmap(0, PG_SZ, PROT_READ, MAP_SHARED, fd, base_offset);
+  
+  if (map_base == MAP_FAILED) {
+    fprintf(stderr, "Error: Failed to map memory: %s\n", strerror(errno));
+    close(fd);
+    return -1;
+  }
+
+  uint32_t reg_value = *((uint32_t *)((char *)map_base + (reg_addr - base_offset)));
+  
+  // VRAM temp calculation: bits 0-11, divided by 32
+  *temp = (reg_value & 0x00000fff) / 0x20;
+
+  munmap(map_base, PG_SZ);
+  close(fd);
+
+  return (*temp < 0x7f) ? 0 : -1; // Sanity check from gputemps
+}
+
+static void signal_handler(int signum) {
+  (void)signum;
+  running = 0;
+  printf("\nRestoring automatic fan control...\n");
+
+  for (int i = 0; i < controlled_device_count; i++) {
+    unsigned int num_fans = 0;
+    if (nvmlDeviceGetNumFans(controlled_devices[i], &num_fans) == NVML_SUCCESS) {
+      for (unsigned int fan = 0; fan < num_fans; fan++) {
+        nvmlDeviceSetFanControlPolicy(controlled_devices[i], fan,
+                                      NVML_FAN_POLICY_TEMPERATURE_CONTINOUS_SW);
+      }
+    }
+  }
 }
 
 static int parse_setpoints(int argc, char* argv[], int start_idx, setpoint_t* setpoints,
@@ -122,24 +169,23 @@ static int parse_setpoints(int argc, char* argv[], int start_idx, setpoint_t* se
   int count = 0;
 
   for (int i = start_idx; i < argc && count < max_setpoints; i++) {
-    if (argv[i][0] == '-') break; // Stop at next option
+    if (argv[i][0] == '-') break;
 
     char* colon = strchr(argv[i], ':');
     if (!colon) continue;
 
     *colon = '\0';
-    long temp, fan;
-    int temp_ok = parse_long(argv[i], &temp, 1, 150); // 1-150°C reasonable GPU temp range
-    int fan_ok = parse_long(colon + 1, &fan, 0, 100); // 0-100%
-    *colon = ':';                                     // Restore for error messages
+    unsigned int temp = atoi(argv[i]);
+    unsigned int fan = atoi(colon + 1);
+    *colon = ':';
 
-    if (temp_ok != 0 || fan_ok != 0) {
-      fprintf(stderr, "Error: Invalid setpoint '%s' (temp 1-150, fan 0-100%%)\n", argv[i]);
+    if (temp == 0 || fan > 100) {
+      fprintf(stderr, "Error: Invalid setpoint '%s' (temp must be >0, fan 0-100%%)\n", argv[i]);
       return -1;
     }
 
-    setpoints[count].temp = (unsigned int)temp;
-    setpoints[count].fan = (unsigned int)fan;
+    setpoints[count].temp = temp;
+    setpoints[count].fan = fan;
     count++;
   }
 
@@ -148,13 +194,13 @@ static int parse_setpoints(int argc, char* argv[], int start_idx, setpoint_t* se
     return -1;
   }
 
-  // Sort setpoints by temperature (allows input in any order)
+  // Sort setpoints by temperature
   for (int i = 0; i < count - 1; i++) {
     for (int j = i + 1; j < count; j++) {
       if (setpoints[i].temp > setpoints[j].temp) {
-        setpoint_t tmp = setpoints[i];
+        setpoint_t temp_sp = setpoints[i];
         setpoints[i] = setpoints[j];
-        setpoints[j] = tmp;
+        setpoints[j] = temp_sp;
       }
     }
   }
@@ -166,30 +212,25 @@ static unsigned int interpolate_fan_speed(unsigned int current_temp, const setpo
                                           int count) {
   if (count == 0) return 0;
 
-  // Below first setpoint
   if (current_temp <= setpoints[0].temp) return setpoints[0].fan;
-
-  // Above last setpoint
   if (current_temp >= setpoints[count - 1].temp) return setpoints[count - 1].fan;
 
-  // Find surrounding setpoints and interpolate (signed math to handle decreasing fan curves)
   for (int i = 0; i < count - 1; i++) {
     if (current_temp >= setpoints[i].temp && current_temp <= setpoints[i + 1].temp) {
-      int temp_range = (int)setpoints[i + 1].temp - (int)setpoints[i].temp;
-      int fan_range = (int)setpoints[i + 1].fan - (int)setpoints[i].fan;
-      int temp_offset = (int)current_temp - (int)setpoints[i].temp;
+      unsigned int temp_range = setpoints[i + 1].temp - setpoints[i].temp;
+      unsigned int fan_range = setpoints[i + 1].fan - setpoints[i].fan;
+      unsigned int temp_offset = current_temp - setpoints[i].temp;
 
-      return (unsigned int)((int)setpoints[i].fan + (fan_range * temp_offset) / temp_range);
+      return setpoints[i].fan + (fan_range * temp_offset) / temp_range;
     }
   }
 
-  return setpoints[0].fan; // Fallback
+  return setpoints[0].fan;
 }
 
 static void clear_lines(int count) {
   if (is_terminal && count > 0) {
-    // Move cursor up and clear lines
-    for (int i = 0; i < count; i++) printf("\033[1A\033[2K"); // Move up one line and clear it
+    for (int i = 0; i < count; i++) printf("\033[1A\033[2K");
   }
 }
 
@@ -201,26 +242,23 @@ static void print_usage(const char* name) {
   printf("  fan [set VALUE]     Show/set fan speed (NVML v12+)\n");
   printf("  fan restore         Restore automatic fan control\n");
   printf("  fanctl SETPOINTS    Dynamic fan control with temperature setpoints\n");
-  printf("  temp                Show temperature\n");
+  printf("  temp                Show GPU core temperature\n");
+  printf("  vramtemp            Show VRAM temperature (requires root)\n"); // Add this
   printf("  status              Show compact status overview\n");
   printf("  list                List all GPUs with index, UUID, and name\n");
   printf("\nDevice Selection:\n");
   printf("  -d, --device LIST   Select devices (default: all)\n");
-  printf("                      Examples: -d 0  -d 0-2  -d 0,2,4\n");
   printf("  -u, --uuid UUID     Select device by UUID\n");
+  printf("\nFan Control Options:\n");
+  printf("  -s, --sensor TYPE   Sensor for fan control (default: core)\n");
+  printf("                      core - Use GPU Core temperature\n");
+  printf("                      vram - Use GDDR6 VRAM temperature (requires root)\n");
   printf("\nOutput Options:\n");
   printf("  --temp-unit UNIT    Temperature unit: C, F, K (default: C)\n");
   printf("  -h, --help          Show this help\n");
   printf("\nExamples:\n");
-  printf("  %s info                    # Show info for all devices\n", name);
-  printf("  %s info -d 0              # Show info for device 0\n", name);
-  printf("  %s power -d 0-2           # Show power for devices 0,1,2\n", name);
-  printf("  %s power set 250 -d 1     # Set 250W limit on device 1\n", name);
-  printf("  %s fan                    # Show fan speeds for all devices\n", name);
-  printf("  %s fan set 80 -d 1        # Set 80%% fan speed on device 1\n", name);
-  printf("  %s fan restore            # Restore automatic control\n", name);
-  printf("  %s fanctl 50:30 70:60 80:90 -d 0  # Dynamic fan control (Ctrl-C to exit)\n", name);
-  printf("  %s info json              # JSON info for all devices\n", name);
+  printf("  %s fanctl 50:30 70:60 80:90 -d 0  # Core temp control\n", name);
+  printf("  %s fanctl 70:30 85:60 -d 0 -s vram  # VRAM temp control\n", name);
 }
 
 static double convert_temperature(unsigned int temp_c, char unit) {
@@ -234,8 +272,6 @@ static double convert_temperature(unsigned int temp_c, char unit) {
 
 static int parse_device_range(const char* range_str, int* devices, int max_devices) {
   char* str = strdup(range_str);
-  if (!str) return 0;
-
   char* token = strtok(str, ",");
   int count = 0;
 
@@ -243,14 +279,11 @@ static int parse_device_range(const char* range_str, int* devices, int max_devic
     char* dash = strchr(token, '-');
     if (dash) {
       *dash = '\0';
-      long start, end;
-      if (parse_long(token, &start, 0, MAX_DEVICES - 1) == 0 &&
-          parse_long(dash + 1, &end, 0, MAX_DEVICES - 1) == 0 && start <= end) {
-        for (long i = start; i <= end && count < max_devices; i++) devices[count++] = (int)i;
-      }
+      int start = atoi(token);
+      int end = atoi(dash + 1);
+      for (int i = start; i <= end && count < max_devices; i++) devices[count++] = i;
     } else {
-      long dev;
-      if (parse_long(token, &dev, 0, MAX_DEVICES - 1) == 0) devices[count++] = (int)dev;
+      devices[count++] = atoi(token);
     }
     token = strtok(NULL, ",");
   }
@@ -293,7 +326,7 @@ static void print_device_info_human(nvmlDevice_t device, int device_id, char tem
   result = nvmlDeviceGetTemperature(device, NVML_TEMPERATURE_GPU, &temperature);
   if (result == NVML_SUCCESS) {
     double temp = convert_temperature(temperature, temp_unit);
-    printf("Temperature: %.1f°%c\n", temp, temp_unit);
+    printf("Temperature: %.1f%c\n", temp, temp_unit);
   }
 
   result = nvmlDeviceGetMemoryInfo(device, &memory);
@@ -381,6 +414,23 @@ static void print_temp_cli(nvmlDevice_t device, int device_id, char temp_unit) {
   }
 }
 
+static void print_vram_temp_cli(nvmlDevice_t device, int device_id) {
+  // Ensure PCI is initialized if it hasn't been yet
+  if (!pci_initialized) {
+    if (init_pci() != 0) {
+      fprintf(stderr, "%d:Error: Failed to initialize PCI for VRAM access\n", device_id);
+      return;
+    }
+  }
+
+  unsigned int temp;
+  if (read_vram_temp(device, &temp) == 0) {
+    printf("%d:%u\n", device_id, temp);
+  } else {
+    fprintf(stderr, "%d:Error: Failed to read VRAM temp (root required or unsupported GPU)\n", device_id);
+  }
+}
+
 static void print_status_cli(nvmlDevice_t device, int device_id, char temp_unit) {
   unsigned int temperature = 0, fan_speed = 0, power_usage = 0;
 
@@ -389,26 +439,25 @@ static void print_status_cli(nvmlDevice_t device, int device_id, char temp_unit)
   nvmlDeviceGetPowerUsage(device, &power_usage);
 
   double temp = convert_temperature(temperature, temp_unit);
-  printf("%d:%.1f°%c,%u%%,%.1fW\n", device_id, temp, temp_unit, fan_speed, power_usage / 1000.0);
+  printf("%d:%.1f%c,%u%%,%.1fW\n", device_id, temp, temp_unit, fan_speed, power_usage / 1000.0);
 }
 
 static int parse_args(int argc, char* argv[], cli_args_t* args) {
   memset(args, 0, sizeof(cli_args_t));
   args->temp_unit = 'C';
   args->all_devices = 1;
+  args->sensor = SENSOR_CORE; // Default to core
 
   if (argc < 2) return -1;
-
-  // Parse command
   static const struct {
     const char* name;
     command_t cmd;
   } commands[] = {{"info", CMD_INFO},     {"power", CMD_POWER}, {"fan", CMD_FAN},
                   {"fanctl", CMD_FANCTL}, {"temp", CMD_TEMP},   {"status", CMD_STATUS},
-                  {"list", CMD_LIST}};
+                  {"list", CMD_LIST},     {"vramtemp", CMD_VRAMTEMP}}; // Add here
 
   args->command = CMD_NONE;
-  for (int i = 0; i < 7; i++) {
+  for (int i = 0; i < 8; i++) { // Update loop limit from 7 to 8
     if (strcmp(argv[1], commands[i].name) == 0) {
       args->command = commands[i].cmd;
       break;
@@ -419,17 +468,15 @@ static int parse_args(int argc, char* argv[], cli_args_t* args) {
   // Check for subcommand or fanctl setpoints
   int start_idx = 2;
   if (args->command == CMD_FANCTL) {
-    // Parse setpoints for fanctl command
     args->setpoint_count = parse_setpoints(argc, argv, 2, args->setpoints, MAX_SETPOINTS);
     if (args->setpoint_count < 0) return -1;
 
-    // Find where setpoints end (next argument starting with -)
     for (int i = 2; i < argc; i++) {
       if (argv[i][0] == '-') {
         start_idx = i;
         break;
       }
-      if (i == argc - 1) start_idx = argc; // No more options
+      if (i == argc - 1) start_idx = argc;
     }
   } else if (argc > 2 && strcmp(argv[2], "set") == 0) {
     args->subcommand = SUBCMD_SET;
@@ -450,13 +497,14 @@ static int parse_args(int argc, char* argv[], cli_args_t* args) {
 
   static struct option long_options[] = {{"device", required_argument, 0, 'd'},
                                          {"uuid", required_argument, 0, 'u'},
+                                         {"sensor", required_argument, 0, 's'}, // Added sensor
                                          {"temp-unit", required_argument, 0, 't'},
                                          {"help", no_argument, 0, 'h'},
                                          {0, 0, 0, 0}};
 
   int opt;
   optind = start_idx;
-  while ((opt = getopt_long(argc, argv, "d:u:t:h", long_options, NULL)) != -1) {
+  while ((opt = getopt_long(argc, argv, "d:u:s:t:h", long_options, NULL)) != -1) {
     switch (opt) {
     case 'd':
       args->device_count = parse_device_range(optarg, args->devices, MAX_DEVICES);
@@ -466,6 +514,16 @@ static int parse_args(int argc, char* argv[], cli_args_t* args) {
       strncpy(args->uuid, optarg, sizeof(args->uuid) - 1);
       args->use_uuid = 1;
       args->all_devices = 0;
+      break;
+    case 's': // Handle sensor selection
+      if (strcmp(optarg, "core") == 0) {
+        args->sensor = SENSOR_CORE;
+      } else if (strcmp(optarg, "vram") == 0) {
+        args->sensor = SENSOR_VRAM;
+      } else {
+        fprintf(stderr, "Error: Invalid sensor '%s'. Use 'core' or 'vram'.\n", optarg);
+        return -1;
+      }
       break;
     case 't':
       args->temp_unit = 0;
@@ -660,6 +718,8 @@ int main(int argc, char* argv[]) {
 
     case CMD_TEMP: print_temp_cli(device, device_id, args.temp_unit); break;
 
+    case CMD_VRAMTEMP: print_vram_temp_cli(device, device_id); break;
+
     case CMD_STATUS: print_status_cli(device, device_id, args.temp_unit); break;
 
     case CMD_LIST: {
@@ -673,7 +733,6 @@ int main(int argc, char* argv[]) {
     } break;
 
     case CMD_FANCTL: {
-      // Check if device supports fan control
       unsigned int num_fans = 0;
       result = nvmlDeviceGetNumFans(device, &num_fans);
       if (result != NVML_SUCCESS || num_fans == 0) {
@@ -682,7 +741,21 @@ int main(int argc, char* argv[]) {
         continue;
       }
 
-      // Store device for cleanup
+      // Initialize PCI if using VRAM sensor
+      if (args.sensor == SENSOR_VRAM) {
+        if (init_pci() != 0) {
+          fprintf(stderr, "%d:Error: Failed to initialize PCI for VRAM access\n", device_id);
+          error_count++;
+          continue;
+        }
+        // Verify we can find the device in PCI list
+        if (!find_pci_dev(device)) {
+           fprintf(stderr, "%d:Error: Cannot find device in PCI bus for VRAM access\n", device_id);
+           error_count++;
+           continue;
+        }
+      }
+
       if (controlled_device_count < MAX_DEVICES) {
         controlled_devices[controlled_device_count] = device;
         controlled_device_ids[controlled_device_count] = device_id;
@@ -699,62 +772,62 @@ int main(int argc, char* argv[]) {
 
   // Handle fanctl main loop
   if (args.command == CMD_FANCTL && controlled_device_count > 0 && error_count == 0) {
-    // Set up signal handlers for graceful termination
-    signal(SIGINT, signal_handler);  // Ctrl+C
-    signal(SIGTERM, signal_handler); // kill command
-    signal(SIGHUP, signal_handler);  // Terminal hangup (SSH disconnect)
-    signal(SIGQUIT, signal_handler); // Ctrl+backslash
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+    atexit(cleanup_pci); // Ensure PCI cleanup on exit
 
-    // Suspend/resume handling - restore auto on suspend, resume manual on continue
-    signal(SIGTSTP, sigtstp_handler); // Ctrl+Z
-    signal(SIGCONT, sigcont_handler); // fg
-
-    // Best-effort cleanup on crash - program state is undefined but
-    // restoring fan control is critical to prevent GPU overheating
-    signal(SIGSEGV, signal_handler); // Segmentation fault
-    signal(SIGBUS, signal_handler);  // Bus error
-    signal(SIGFPE, signal_handler);  // Floating point exception
-    signal(SIGILL, signal_handler);  // Illegal instruction
-
-    // Check if stdout is a terminal
     is_terminal = isatty(STDOUT_FILENO);
 
-    printf("Starting dynamic fan control for %d device(s) (Ctrl-C to exit)\n",
-           controlled_device_count);
-    printf("Setpoints (input always °C): ");
+    const char* sensor_name = (args.sensor == SENSOR_VRAM) ? "VRAM" : "Core";
+    printf("Starting dynamic fan control for %d device(s) using %s temperature (Ctrl-C to exit)\n",
+           controlled_device_count, sensor_name);
+    printf("Setpoints: ");
     for (int sp = 0; sp < args.setpoint_count; sp++) {
-      printf("%u°C:%u%%", args.setpoints[sp].temp, args.setpoints[sp].fan);
+      printf("%u:%u%%", args.setpoints[sp].temp, args.setpoints[sp].fan);
       if (sp < args.setpoint_count - 1) printf(" ");
     }
     printf("\n");
 
-    if (is_terminal) printf("\n"); // Add blank line for device status updates
+    if (is_terminal) printf("\n");
 
     // Main control loop
     int first_iteration = 1;
     while (running) {
       if (is_terminal && !first_iteration) {
-        // Clear previous device status lines
         clear_lines(controlled_device_count);
       }
 
       for (int dev_idx = 0; dev_idx < controlled_device_count; dev_idx++) {
         nvmlDevice_t device = controlled_devices[dev_idx];
-        int device_id = controlled_device_ids[dev_idx]; // Get original device ID
-
+        int device_id = controlled_device_ids[dev_idx];
         unsigned int current_temp = 0;
-        result = nvmlDeviceGetTemperature(device, NVML_TEMPERATURE_GPU, &current_temp);
-        if (result != NVML_SUCCESS) {
-          fprintf(stderr, "%d:Error: Cannot read temperature (%s)\n", device_id,
-                  nvmlErrorString(result));
-          running = 0;
-          break;
+        int temp_result = 0;
+
+        if (args.sensor == SENSOR_VRAM) {
+          temp_result = read_vram_temp(device, &current_temp);
+          if (temp_result != 0) {
+            fprintf(stderr, "%d:Error reading VRAM temp. Falling back to Core temp.\n", device_id);
+            // Fallback to core if VRAM read fails
+            temp_result = nvmlDeviceGetTemperature(device, NVML_TEMPERATURE_GPU, &current_temp);
+            if (temp_result != NVML_SUCCESS) {
+                fprintf(stderr, "%d:Error reading Core temp. Aborting.\n", device_id);
+                running = 0;
+                break;
+            }
+          }
+        } else {
+          temp_result = nvmlDeviceGetTemperature(device, NVML_TEMPERATURE_GPU, &current_temp);
+          if (temp_result != NVML_SUCCESS) {
+            fprintf(stderr, "%d:Error: Cannot read temperature (%s)\n", device_id,
+                    nvmlErrorString(temp_result));
+            running = 0;
+            break;
+          }
         }
 
         unsigned int target_fan =
             interpolate_fan_speed(current_temp, args.setpoints, args.setpoint_count);
 
-        // Set fan speed for all fans on this device
         unsigned int num_fans = 0;
         nvmlDeviceGetNumFans(device, &num_fans);
 
@@ -769,22 +842,22 @@ int main(int argc, char* argv[]) {
 
         if (fan_errors == 0) {
           double temp_display = convert_temperature(current_temp, args.temp_unit);
-          printf("%d:%.1f°%c -> %u%%\n", device_id, temp_display, args.temp_unit, target_fan);
+          const char* sensor_label = (args.sensor == SENSOR_VRAM) ? "V" : ""; // Mark VRAM
+          printf("%d:%.1f%c%s -> %u%%\n", device_id, temp_display, args.temp_unit, sensor_label, target_fan);
         } else {
           running = 0;
           break;
         }
       }
 
-      fflush(stdout); // Ensure output is displayed immediately
-
+      fflush(stdout);
       first_iteration = 0;
-      if (running) sleep(2); // Update every 2 seconds
+      if (running) sleep(2);
     }
-
-    // Cleanup is handled by signal handler
   }
 
+  cleanup_pci();
   nvmlShutdown();
   return !!error_count;
 }
+
